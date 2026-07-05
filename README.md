@@ -46,9 +46,9 @@ python radioss2inp.py input.rad output.inp
 | `/FUNCT`                      | `*AMPLITUDE`                                                 | 函数表                                |
 | `/GRNOD/NODE`                 | `*NSET`                                                      | 节点集                                |
 | `/INIVEL/TRA`                 | `*INITIAL CONDITIONS, TYPE=VELOCITY`                          | 初始平动速度                          |
-| `/GRAV`                       | `*DLOAD`（BX/BY/BZ，保留符号）                                | 重力 / 体加速度载荷                   |
+| `/GRAV`                       | `*DLOAD`（GRAV 加速度载荷，作用于 `ALL_ELEMS`）              | 重力 / 体加速度载荷                   |
 | `/INTER/TYPE2`                | `*TIE` + `*SURFACE, TYPE=NODE`                               | 绑定接触（slave 节点集 ↔ master 面）  |
-| `/RWALL/PLANE`                | `*ANALYTICAL SURFACE` + `*RIGID BODY` + `*CONTACT PAIR`      | 平面刚性墙 + 接触对                   |
+| `/RWALL/PLANE`                | `R3D4` 离散刚性单元 + `*RIGID BODY` + `*CONTACT PAIR`        | 平面刚性墙 + 接触对                   |
 | （自动生成）                  | `*STEP` + `*DYNAMIC, EXPLICIT`                               | 显式动力学分析步                      |
 
 ## 验证项
@@ -95,6 +95,7 @@ python radioss2inp.py input.rad output.inp
 
 - `*TIE` 的 master 面采用基于节点的 `*SURFACE, TYPE=NODE`，而非基于单元面的 surface。若出现穿透或刚度过大问题，可改写为基于 SNEG/SPOS 单元面的 surface。
 - 刚性墙的接触 slave 面 = `ALL_NODES`（全模型节点）。覆盖范围较保守，运行时如需加速可改为各 PART 表面节点集。
+- 刚性墙使用单个 R3D4 单元（4 个角节点）表示；如需更精细的几何，可改为多个 R3D4 单元组成的网格。
 - 未转换 `/DEFAULT/INTER/TYPE2` 与 `/DEF_SOLID` 控制卡片（Abaqus 在 `*SOLID SECTION` 与各 `*TIE` 中分别指定即可）。
 - `/MAT/PLAS_TAB` 仅支持 `N_funct=1` 的单函数塑性表；多函数率相关塑性未转换。
 

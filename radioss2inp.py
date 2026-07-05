@@ -630,6 +630,10 @@ class RadiossToAbaqus:
         f.write('**\n** -- ELEMENTS & SECTIONS\n')
         # Collect element IDs per part to verify uniqueness
         seen_eid = set()
+        # Track the global element-id range so we can build ALL_ELEMS
+        # via *ELSET, GENERATE (much more compact than listing 130k IDs).
+        all_eid_min = None
+        all_eid_max = None
         for pid, part in self.parts.items():
             if not part['elems']:
                 continue
@@ -646,11 +650,22 @@ class RadiossToAbaqus:
                     continue
                 seen_eid.add(eid)
                 f.write(f'{eid}, ' + ', '.join(str(n) for n in nids) + '\n')
+                if all_eid_min is None or eid < all_eid_min:
+                    all_eid_min = eid
+                if all_eid_max is None or eid > all_eid_max:
+                    all_eid_max = eid
             # Section assignment
             mat_name = self._safe_name(mat['name'], prefix=f'MAT{part["mat_id"]}') if mat else f'MAT{part["mat_id"]}'
             f.write(f'** Section for part {pid}: {part["name"]}\n')
             f.write(f'*SOLID SECTION, ELSET={elset_name}, MATERIAL={mat_name}\n')
             f.write(',\n')  # empty data line (no orientation etc.)
+        # Build ALL_ELEMS elset for use by *DLOAD (gravity) and mass scaling
+        if all_eid_min is not None:
+            f.write('**\n** -- Global element set (all deformable elements)\n')
+            f.write('*ELSET, ELSET=ALL_ELEMS, GENERATE\n')
+            f.write(f'{all_eid_min}, {all_eid_max}, 1\n')
+        self._all_eid_min = all_eid_min
+        self._all_eid_max = all_eid_max
 
     def _write_materials(self):
         f = self._f
@@ -729,31 +744,53 @@ class RadiossToAbaqus:
         f = self._f
         if not self.grav:
             return
-        f.write('**\n** -- BODY FORCE LOADS (from /GRAV)\n')
-        # Map direction -> BX/BY/BZ
-        # Abaqus *DLOAD body force BX/BY/BZ is a body force per unit mass
-        # (= acceleration), expressed in length/time^2.
-        dir_map = {'X': 'BX', 'Y': 'BY', 'Z': 'BZ'}
+        f.write('**\n** -- GRAVITY LOADS (from /GRAV)\n')
+        # IMPORTANT: Abaqus/Explicit feinput does NOT support the BX/BY/BZ
+        # body-force load types in *DLOAD.  Use the GRAV load type instead,
+        # which applies a uniform gravitational acceleration to an element
+        # set (not a node set).  Syntax:
+        #   *DLOAD
+        #   elset, GRAV, magnitude, comp1, comp2, comp3
+        # where magnitude is in length/time^2 (mm/s^2 here) and the comp1..3
+        # are the unit direction cosines (the magnitude is unsigned; the
+        # direction carries the sign).
+        dir_vec = {'X': (1.0, 0.0, 0.0),
+                   'Y': (0.0, 1.0, 0.0),
+                   'Z': (0.0, 0.0, 1.0)}
+        # Use the global ALL_ELEMS elset.  Radioss /GRAV is usually applied
+        # to GRNOD=ALL which is equivalent to the whole model.
+        elset = 'ALL_ELEMS'
         for gv_id, gv in self.grav.items():
             gn = self.grnod.get(gv['grnod_id'])
             if not gn:
                 self.warnings.append(
                     f'GRAV {gv_id} references missing GRNOD {gv["grnod_id"]}')
                 continue
-            nset = f'NSET_G{gv["grnod_id"]}_{self._safe_name(gn["name"], prefix=f"NSET_G{gv["grnod_id"]}")}'
-            load = dir_map.get(gv['dir'])
-            if not load:
+            vec = dir_vec.get(gv['dir'])
+            if vec is None:
                 self.warnings.append(f'GRAV {gv_id}: unknown direction {gv["dir"]}')
                 continue
-            # fscale carries the signed acceleration (mm/s^2 with the
-            # amplitude multiplier = 1.0). Preserve the sign so the
-            # direction is correctly represented in Abaqus.
+            # fscale is the signed acceleration (mm/s^2).
             mag = gv['fscale']
+            # GRAV magnitude must be >= 0; the sign goes into the
+            # direction vector.
+            if mag < 0:
+                comp = (-vec[0], -vec[1], -vec[2])
+                amag = -mag
+            else:
+                comp = vec
+                amag = mag
             func = self.functions.get(gv['func_id'], {})
-            amp = f'AMP_F{gv["func_id"]}_{self._safe_name(func.get("name", f"F{gv["func_id"]}"), prefix=f"F{gv["func_id"]}")}'
-            f.write(f'** GRAV {gv_id}: dir={gv["dir"]} accel={mag:.6E} mm/s^2\n')
+            func_name = func.get('name', f'F{gv["func_id"]}') if func else f'F{gv["func_id"]}'
+            amp = f'AMP_F{gv["func_id"]}_{self._safe_name(func_name, prefix=f"F{gv["func_id"]}")}'
+            f.write(f'** GRAV {gv_id}: dir={gv["dir"]} accel={mag:.6E} mm/s^2 '
+                    f'(applied to {elset})\n')
+            # *DLOAD GRAV supports the AMPLITUDE parameter; if the
+            # referenced function is constant (value=1) the amplitude is
+            # redundant but still valid.
             f.write(f'*DLOAD, AMPLITUDE={amp}\n')
-            f.write(f'{nset}, {load}, {mag:.6E}\n')
+            f.write(f'{elset}, GRAV, {amag:.6E}, '
+                    f'{comp[0]:.6f}, {comp[1]:.6f}, {comp[2]:.6f}\n')
 
     def _write_tie_constraints(self):
         f = self._f
@@ -800,10 +837,16 @@ class RadiossToAbaqus:
         if not self.rwalls:
             return
         f.write('**\n** -- RIGID WALL (from /RWALL/PLANE)\n')
-        # Build a node set of ALL nodes in the model so we can detect
-        # contact with the rigid wall.  Using a node-based surface from
-        # this nset is the most robust choice for a generic drop test
-        # (per-element surfaces would require element-face lookups).
+        # Implementation note:
+        # We build a DISCRETE rigid surface using R3D4 elements (4-node
+        # bilinear rigid quadrilateral) instead of an *ANALYTICAL SURFACE.
+        # The discrete-rigid-surface form is more reliably parsed by
+        # feinput across Abaqus versions and avoids the "ANALYTICAL
+        # SURFACE does not have corresponding *SURFACE" warning that some
+        # feinput builds emit when a *RIGID BODY references an analytical
+        # surface defined via *ANALYTICAL SURFACE.
+        # Build a node set of ALL nodes in the model so the contact slave
+        # surface covers the whole deformable mesh.
         all_nset = 'ALL_NODES'
         f.write(f'*NSET, NSET={all_nset}, GENERATE\n')
         if self.node_min_id and self.node_max_id:
@@ -820,29 +863,7 @@ class RadiossToAbaqus:
                 self.warnings.append(f'RWALL {rw_id}: degenerate normal')
                 continue
             nx /= norm; ny /= norm; nz /= norm
-            # Reference node placed far along the normal (so it is far
-            # from the contact zone, but still inside the analysis).
-            ref_nid = 9_000_000 + rw_id
-            ref_x = rw['XM'] + 1000.0 * nx
-            ref_y = rw['YM'] + 1000.0 * ny
-            ref_z = rw['ZM'] + 1000.0 * nz
-            f.write(f'** Rigid wall {rw_id}: {rw["name"]}\n')
-            f.write(f'** Plane passes through ({rw["XM"]:.4f}, '
-                    f'{rw["YM"]:.4f}, {rw["ZM"]:.4f})\n')
-            f.write(f'** Normal = ({nx:.4f}, {ny:.4f}, {nz:.4f})\n')
-            f.write(f'** Friction = {rw["fric"]:.4f}\n')
-            # Reference node
-            f.write('*NODE\n')
-            f.write(f'{ref_nid}, {ref_x:.4f}, {ref_y:.4f}, {ref_z:.4f}\n')
-            # Build an analytical rigid surface in 3D.  Abaqus syntax:
-            #   *ANALYTICAL SURFACE, NAME=name, TYPE=SEGMENTS
-            #   START, x, y, z
-            #   LINE, x, y, z    (or CIRCLE/CUBSPL/...)
-            # The segments live in the local 2-D coordinate system of the
-            # surface defined via *SYSTEM.
-            #
-            # To keep the conversion generic we project the planar wall
-            # into the local (u, v) coordinates of the plane.
+            # Pick two in-plane orthonormal vectors (u, v)
             if abs(nz) < 0.9:
                 u = (ny, -nx, 0.0)
             else:
@@ -850,47 +871,67 @@ class RadiossToAbaqus:
             un = math.sqrt(u[0]**2 + u[1]**2 + u[2]**2)
             u = (u[0]/un, u[1]/un, u[2]/un)
             v = (ny*u[2] - nz*u[1], nz*u[0] - nx*u[2], nx*u[1] - ny*u[0])
-            L = 200.0  # half-size of the wall (mm)
+            # Half-size of the rigid wall (mm).  Use a generous size so
+            # the dropping object remains inside the contact zone.
+            L = 200.0
+            # 4 corner nodes of the wall, centred at M
             corners = []
             for su, sv in [(-1, -1), (1, -1), (1, 1), (-1, 1)]:
                 cx = rw['XM'] + su*L*u[0] + sv*L*v[0]
                 cy = rw['YM'] + su*L*u[1] + sv*L*v[1]
                 cz = rw['ZM'] + su*L*u[2] + sv*L*v[2]
                 corners.append((cx, cy, cz))
-            # Need a local coordinate system for the analytical surface:
-            # origin = M, x-axis = u, y-axis = v
-            f.write(f'*SYSTEM\n')
-            f.write(f'{rw["XM"]:.4f}, {rw["YM"]:.4f}, {rw["ZM"]:.4f}\n')
-            f.write(f'{u[0]:.4f}, {u[1]:.4f}, {u[2]:.4f}\n')
-            f.write(f'{v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f}\n')
+            # Reference node placed far along the normal (so it is far
+            # from the contact zone but still inside the analysis).
+            ref_nid = 9_000_000 + rw_id
+            ref_x = rw['XM'] + 1000.0 * nx
+            ref_y = rw['YM'] + 1000.0 * ny
+            ref_z = rw['ZM'] + 1000.0 * nz
+            # Corner node IDs (4 corners + 1 reference node)
+            cn_ids = [9_100_000 + rw_id*10 + i for i in range(4)]
+            f.write(f'** Rigid wall {rw_id}: {rw["name"]}\n')
+            f.write(f'** Plane passes through ({rw["XM"]:.4f}, '
+                    f'{rw["YM"]:.4f}, {rw["ZM"]:.4f})\n')
+            f.write(f'** Normal = ({nx:.4f}, {ny:.4f}, {nz:.4f})\n')
+            f.write(f'** Friction = {rw["fric"]:.4f}\n')
+            # Reference node and 4 corner nodes
+            f.write('*NODE\n')
+            f.write(f'{ref_nid}, {ref_x:.4f}, {ref_y:.4f}, {ref_z:.4f}\n')
+            for nid, (cx, cy, cz) in zip(cn_ids, corners):
+                f.write(f'{nid}, {cx:.4f}, {cy:.4f}, {cz:.4f}\n')
+            # R3D4 rigid element connecting the 4 corners
+            elset_name = f'RWALL_ELSET_{rw_id}'
+            rigid_eid = 8_000_000 + rw_id
+            f.write(f'*ELEMENT, TYPE=R3D4, ELSET={elset_name}\n')
+            f.write(f'{rigid_eid}, {cn_ids[0]}, {cn_ids[1]}, '
+                    f'{cn_ids[2]}, {cn_ids[3]}\n')
+            # Element-based surface for the rigid wall.
+            # For a single R3D4 element used as a rigid wall we list ALL
+            # six faces (S1..S6) on the surface so the contact works
+            # regardless of which face the deformable mesh approaches.
             surf_name = f'RWALL_S{rw_id}'
-            f.write(f'*ANALYTICAL SURFACE, NAME={surf_name}, '
-                    f'TYPE=SEGMENTS\n')
-            # In local coordinates, the corners are at (+/-L, +/-L)
-            f.write(f'START, {-L:.4f}, {-L:.4f}\n')
-            f.write(f'LINE, {L:.4f}, {-L:.4f}\n')
-            f.write(f'LINE, {L:.4f}, {L:.4f}\n')
-            f.write(f'LINE, {-L:.4f}, {L:.4f}\n')
-            f.write(f'LINE, {-L:.4f}, {-L:.4f}\n')
-            # Rigid body that owns the analytical surface
-            f.write(f'*RIGID BODY, REF NODE={ref_nid}, '
-                    f'ANALYTICAL SURFACE={surf_name}\n')
-            # Fully constrain the reference node
+            f.write(f'*SURFACE, NAME={surf_name}\n')
+            for face in ('S1', 'S2', 'S3', 'S4', 'S5', 'S6'):
+                f.write(f'{elset_name}, {face}\n')
+            # Rigid body that owns the rigid elements
+            f.write(f'*RIGID BODY, REF NODE={ref_nid}, ELSET={elset_name}\n')
+            # Fully constrain the reference node (encastre)
             f.write('*BOUNDARY\n')
             f.write(f'{ref_nid}, 1, 6\n')
-            # Contact pair between all model nodes (as a node-based
-            # surface) and the analytical rigid surface.
+            # Slave surface (all model nodes, node-based)
             slave_surf = f'RWALL_SLAVE_{rw_id}'
             f.write(f'*SURFACE, TYPE=NODE, NAME={slave_surf}\n')
             f.write(f'{all_nset}\n')
-            # Surface interaction with friction - must be defined before
-            # the *CONTACT PAIR that references it.
-            f.write(f'*SURFACE INTERACTION, NAME=RWALL_IP{rw_id}\n')
+            # Surface interaction (hard contact + friction) - must be
+            # defined before the *CONTACT PAIR that references it.
+            ip_name = f'RWALL_IP{rw_id}'
+            f.write(f'*SURFACE INTERACTION, NAME={ip_name}\n')
             f.write('*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD\n')
             f.write('*FRICTION\n')
             f.write(f'{rw["fric"]:.4f}\n')
+            # Contact pair: deformable slave (nodes) vs rigid master (R3D4)
             f.write(f'** Contact pair (rigid wall {rw_id})\n')
-            f.write(f'*CONTACT PAIR, INTERACTION=RWALL_IP{rw_id}, '
+            f.write(f'*CONTACT PAIR, INTERACTION={ip_name}, '
                     f'TYPE=SURFACE TO SURFACE\n')
             f.write(f'{slave_surf}, {surf_name}\n')
 

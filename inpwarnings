@@ -1,0 +1,14 @@
+Warning:  *DLOAD with BX is not supported
+                Resolution:  Data line skipped. Edit the deck to include them back.
+Warning:  Unsupported information found in input deck
+                Resolution:  Unsupported text written to file: Cell_Phone_Drop.inp0.hmx
+Warning:  *DLOAD with BY is not supported
+                Resolution:  Data line skipped. Edit the deck to include them back.
+Warning:  *DLOAD with BZ is not supported
+                Resolution:  Data line skipped. Edit the deck to include them back.
+Warning:  Unsupported information found in the input deck.
+                Resolution:  Unsupported text is moved to control cards. Check help for further information.
+Warning:  *RIGID BODY, ANALYTICAL SURFACE = RWALL_S1 does not have corresponding *SURFACE, NAME = RWALL_S1
+                Resolution:  Anlalytical Surface is preserved. Include the relevant *SURFACE card.
+Summary:Feinput finished with 0 errors and 6 warnings.
+

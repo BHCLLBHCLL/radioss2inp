@@ -119,18 +119,41 @@ for line in it:
 
 源文件的 `/TITLE` 后跟一个空行，直接用 `_read_data_line()` 会错误地把下一个关键字（`/DEFAULT/INTER/TYPE2`）当作标题。解决方案：新增 `_read_optional_data_line()`，遇到 `/` 开头的行时不消费，直接 `return None` 并通过 `_dispatch_keyword()` 处理该关键字。
 
-### 4.4 `/GRAV` 的方向符号保留
+### 4.4 `/GRAV` 重力载荷 → `*DLOAD GRAV` 转换
 
-Radioss 中 GRAV 的 `Fscale` 是带符号的加速度。Abaqus `*DLOAD` 的 `BX/BY/BZ` 同样支持符号（正负代表方向），转换时**必须保留** `Fscale` 的符号，否则重力方向会反转。早期实现错误地取了绝对值，已修正。
+Radioss 中 GRAV 的 `Fscale` 是带符号的加速度（mm/s²），方向通过 `dir` 字段（X/Y/Z）指定，作用于 `GRNOD` 节点集。
 
-### 4.5 刚性墙几何重建
+Abaqus 转换中的关键差异：
+- **`BX/BY/BZ` 在 Abaqus/Explicit feinput 不支持**：尝试用 `*DLOAD` + `BX/BY/BZ` 时，feinput 输出 `*DLOAD with BX is not supported`，并跳过该数据行。
+- **正确做法**：使用 `GRAV` 载荷类型，作用于**单元集**（不是节点集），数据行语法为：
+  ```
+  elset, GRAV, magnitude, comp1, comp2, comp3
+  ```
+  其中 `magnitude` 是无符号加速度幅值，`comp1..3` 是单位方向余弦（带符号，承载方向）。
+- **GRNOD → ELSET 映射**：由于 `*DLOAD` 作用于单元，需要把 GRNOD 节点集映射到 ELSET。脚本采用简化策略：生成 `ALL_ELEMS` 全局单元集（用 `*ELSET, GENERATE` 紧凑表示，避免列出 13 万个单元 ID），将所有 GRAV 载荷应用到 `ALL_ELEMS`。这对跌落测试中"重力作用于整个模型"的常规场景是正确的。
+- **符号处理**：当 `fscale < 0` 时，方向余弦取反（如 X 方向加速度为负，则 `comp = (-1, 0, 0)`），`magnitude = |fscale|`，保证加速度方向正确。
 
-`/RWALL/PLANE` 只给出平面上的两个点 M 和 M1（M→M1 即法向）。转换为 Abaqus `*ANALYTICAL SURFACE` 时需要：
+### 4.5 刚性墙几何重建 → R3D4 离散刚性面
+
+`/RWALL/PLANE` 只给出平面上的两个点 M 和 M1（M→M1 即法向）。
+
+**早期实现尝试 `*ANALYTICAL SURFACE`**：用 `*SYSTEM` + `START/LINE` 段定义解析刚性面。但 feinput 报错 `*RIGID BODY, ANALYTICAL SURFACE = RWALL_S1 does not have corresponding *SURFACE, NAME = RWALL_S1`，说明该 feinput 版本期望 `*RIGID BODY` 引用的是 `*SURFACE` 而非 `*ANALYTICAL SURFACE`。
+
+**最终实现改用离散刚性面（R3D4 单元）**：
 
 1. 计算法向单位向量 `n = (M1 - M) / |M1 - M|`
 2. 构造平面内两个正交向量 `u`、`v`（用 Gram-Schmidt 从 `(ny, -nx, 0)` 或 `(0, nz, -ny)` 出发）
-3. 用 `*SYSTEM` 定义局部坐标系（原点=M，x=u，y=v）
-4. 在局部坐标系下输出 4 段 `LINE` 形成矩形平面（±L=200 mm）
+3. 在平面上生成 4 个角节点（±L=200 mm 沿 u、v 方向）
+4. 创建 1 个 R3D4 单元（4 节点四边形刚性单元）连接 4 个角节点
+5. 用 `*SURFACE` 列出该单元的全部 6 个面（S1..S6），保证接触面无论从哪一侧接近都能被检测到
+6. 用 `*RIGID BODY, REF NODE=..., ELSET=...` 将 R3D4 单元归属到参考节点
+7. 用 `*BOUNDARY` 完全约束参考节点（1-6 自由度）
+8. 生成 `*CONTACT PAIR`：slave = `*SURFACE, TYPE=NODE`（覆盖 ALL_NODES），master = R3D4 单元面 surface
+
+这种方法的关键优势：
+- **feinput 兼容性好**：所有 Abaqus 版本都支持 R3D4 离散刚性面
+- **避免 `*ANALYTICAL SURFACE` 的 `*SYSTEM` 关联问题**
+- **几何简单清晰**：单个四边形面，易于调试与可视化
 
 ### 4.6 命名安全化 `_safe_name()`
 
@@ -162,11 +185,13 @@ return cleaned[:80]
 | `ValueError: invalid literal for int() with base 10: ''` | `sid` 在两段式关键字（如 `/PART/1`）中是空字符串 | 引入 `id_of(slot)` 帮助函数，根据 slot 索引取 ID         |
 | 标题变成 `/DEFAULT/INTER/TYPE2`                     | `/TITLE` 后跟空行，`_read_data_line` 误读了下一个关键字 | 新增 `_read_optional_data_line()`，不消费关键字行         |
 | 节点统计数 = 0                                       | `node_count` 只在 EOF 分支赋值                  | 在遇到下一个关键字的 `return` 分支也赋值                  |
-| `*DLOAD` 重力方向丢失                                | 错误地取了 `abs(mag)`                          | 保留 `mag` 的符号                                         |
+| `*DLOAD` 重力方向丢失                                | 错误地取了 `abs(mag)`                          | 保留 `mag` 的符号                                          |
 | `*TIE` 参数拼写错误                                  | `TOLERENCE` 应为 `TOLERANCE`                   | 修正拼写                                                  |
 | 刚性墙使用 `*SURFACE, TYPE=SEGMENTS`（非解析刚性面） | Abaqus 解析刚性面应使用 `*ANALYTICAL SURFACE`  | 改为 `*ANALYTICAL SURFACE` + `*SYSTEM` + `LINE` 段         |
 | `*VARIABLE MASS SCALING` 引用未定义的 `ALL_ELEMS`   | 未生成全单元集                                  | 移除该行（用户可按需手动添加 mass scaling）               |
 | `*CONTACT PAIR` 在 `*SURFACE INTERACTION` 之前      | Abaqus 要求 surface interaction 先定义           | 调整写出顺序：先 `*SURFACE INTERACTION` 再 `*CONTACT PAIR` |
+| `*DLOAD with BX/BY/BZ is not supported`（feinput 警告） | Abaqus/Explicit feinput 不支持 BX/BY/BZ 体载荷类型 | 改用 `GRAV` 载荷类型，作用于 `ALL_ELEMS` 单元集；方向余弦承载符号 |
+| `*RIGID BODY, ANALYTICAL SURFACE` 缺少对应 `*SURFACE`（feinput 警告） | 该 feinput 版本期望 `*RIGID BODY` 引用 `*SURFACE` 而非 `*ANALYTICAL SURFACE` | 改用离散刚性面 R3D4 单元 + `*SURFACE` + `*RIGID BODY, ELSET=` |
 
 ## 7. 测试结果
 
