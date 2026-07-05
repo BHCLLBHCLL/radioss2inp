@@ -31,6 +31,7 @@
 - `/BRICK`（8 节点六面体）→ 10 个 PART，共 **20,618** 个单元
 - `/TETRA10`（10 节点四面体）→ 7 个 PART，共 **109,600** 个单元
 - 合计 **130,218** 个单元
+- 注意：TETRA10 转换为 `C3D10M`（非 `C3D10`），因 Abaqus/Explicit 不支持 `C3D10`
 
 ### 2.3 关键字格式特征
 
@@ -69,19 +70,26 @@ Radioss 关键字有 2 种 ID 写法：
 
 ### 3.3 写出策略
 
-按 Abaqus 6.14 标准顺序输出：
+按 Abaqus 6.14 标准顺序输出（注意：step-level 关键字必须放在 `*STEP` 之内）：
 
 1. `*HEADING` + `*PREPRINT`
 2. `*NODE`
 3. 每个 PART：`*ELEMENT` + `*SOLID SECTION`
 4. 所有材料：`*MATERIAL` + `*ELASTIC` + `*PLASTIC` + `*DENSITY`
-5. 所有 `*NSET`、`*AMPLITUDE`
-6. `*INITIAL CONDITIONS, TYPE=VELOCITY`
-7. `*DLOAD`（体加速度）
-8. `*TIE` 约束
-9. 刚性墙：`*ANALYTICAL SURFACE` + `*RIGID BODY` + `*CONTACT PAIR`
-10. `*STEP` + `*DYNAMIC, EXPLICIT` + 输出请求
-11. 验证报告（以 `**` 注释形式附加）
+5. 所有 `*NSET`（来自 /GRNOD/NODE）
+6. `*ELSET`（全局单元集 `ALL_ELEMS`，供 `*DLOAD GRAV` 引用）
+7. `*AMPLITUDE`（来自 /FUNCT）
+8. `*INITIAL CONDITIONS, TYPE=VELOCITY`（每 DOF 一行：`node, dof, value`）
+9. `*TIE` 约束
+10. 刚性墙（model level）：`*NSET (ALL_NODES)` + `*NODE` + `*ELEMENT, TYPE=R3D4` + `*SURFACE` + `*RIGID BODY` + `*BOUNDARY` + `*SURFACE INTERACTION`
+11. `*STEP, NLGEOM=YES`（不带 `INC`）
+    - `*DYNAMIC, EXPLICIT` + 数据行（4 字段：空, 时长, 空, 最大增量）
+    - `*BULK VISCOSITY`
+    - `*CONTACT PAIR, MECHANICAL CONSTRAINT=PENALTY`（step level，不带 `TYPE=` 参数）
+    - `*DLOAD GRAV`（step level）
+    - `*OUTPUT` / `*ELEMENT OUTPUT` / `*NODE OUTPUT`
+12. `*END STEP`
+13. 验证报告（以 `**` 注释形式附加）
 
 ## 4. 关键实现要点
 
@@ -102,7 +110,9 @@ def id_of(default_slot):
 - 两段式（`/PART/1`）→ `id_of(2)`
 - 三段式（`/MAT/ELAST/4`）→ `id_of(3)`
 
-### 4.2 TETRA10 双行记录解析
+### 4.2 TETRA10 双行记录解析与节点顺序重排
+
+**双行记录解析**：
 
 ```python
 pending_eid = None
@@ -114,6 +124,25 @@ for line in it:
         self.parts[part_id]['elems'].append((pending_eid, nids))
         pending_eid = None
 ```
+
+**节点顺序重排（Radioss → Abaqus C3D10M）**：
+
+经实际计算单元体积发现，Radioss 的 TETRA10 角点排列方向与 Abaqus C3D10M 相反（signed volume 为负），导致 Abaqus 报"109,600 elements have zero volume"错误。
+
+转换规则：交换角点 2 与 3，并相应交换 midside 节点。0-based 索引映射：
+
+```
+Radioss:  N1 N2 N3 N4 N5(mid12) N6(mid23) N7(mid13) N8(mid14) N9(mid24) N10(mid34)
+Abaqus:   N1 N3 N2 N4 N7(mid13) N6(mid32=23) N5(mid31=12) N8(mid14) N10(mid34) N9(mid24=42)
+索引映射: [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]
+```
+
+```python
+REORDER = [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]
+nids = [nids[i] for i in REORDER]
+```
+
+重排后抽样验证 5 个 C3D10M 单元，signed volume 全部为正，确认方向正确。
 
 ### 4.3 `/TITLE` 的空数据行处理
 
@@ -145,10 +174,21 @@ Abaqus 转换中的关键差异：
 2. 构造平面内两个正交向量 `u`、`v`（用 Gram-Schmidt 从 `(ny, -nx, 0)` 或 `(0, nz, -ny)` 出发）
 3. 在平面上生成 4 个角节点（±L=200 mm 沿 u、v 方向）
 4. 创建 1 个 R3D4 单元（4 节点四边形刚性单元）连接 4 个角节点
-5. 用 `*SURFACE` 列出该单元的全部 6 个面（S1..S6），保证接触面无论从哪一侧接近都能被检测到
+5. 用 `*SURFACE` 列出该单元的 `SPOS` 面（R3D4 仅接受 `SPOS`/`SNEG`/`E1..E4`，不接受 `S1..S6`）
 6. 用 `*RIGID BODY, REF NODE=..., ELSET=...` 将 R3D4 单元归属到参考节点
 7. 用 `*BOUNDARY` 完全约束参考节点（1-6 自由度）
-8. 生成 `*CONTACT PAIR`：slave = `*SURFACE, TYPE=NODE`（覆盖 ALL_NODES），master = R3D4 单元面 surface
+8. 生成 `*SURFACE INTERACTION`（model level）定义接触属性
+9. 生成 `*CONTACT PAIR`（step level，必须放在 `*STEP` 之内，且不带 `TYPE=` 参数，使用 `MECHANICAL CONSTRAINT=PENALTY`）：slave = `*SURFACE, TYPE=NODE`（覆盖 ALL_NODES），master = R3D4 单元面 surface
+
+**关键修正**（feinput 报错后调整）：
+
+| 错误信息 | 根因 | 修正 |
+|---------|------|------|
+| `7 elements are distorted` 中 `S1..S6` 不识别 | R3D4 仅接受 `SPOS`/`SNEG` | 改为 `SPOS` |
+| `*NSET, GENERATE` 产生未定义节点 | 节点 ID 非连续，有空洞 | 改为显式列出所有节点 ID |
+| `KEYWORD CARDS FOR STEP DEPENDENT INPUT MUST APPEAR AFTER *STEP` | `*CONTACT PAIR` 放在 model level | 移到 `*STEP` 之内 |
+| `UNKNOWN PARAMETER TYPE` | `TYPE=SURFACE TO SURFACE` 不被识别 | 移除 `TYPE=` 参数 |
+| `The requested number of domains cannot be created`（`.sta`） | 默认运动学接触 + 14 个 `*TIE` 约束导致多域分解失败；节点同时参与运动学接触与运动学约束 | 改用 `MECHANICAL CONSTRAINT=PENALTY` |
 
 这种方法的关键优势：
 - **feinput 兼容性好**：所有 Abaqus 版本都支持 R3D4 离散刚性面
@@ -166,6 +206,70 @@ if not cleaned[0].isalpha():
     cleaned = (prefix or 'X') + '_' + cleaned
 return cleaned[:80]
 ```
+
+### 4.7 C3D10 → C3D10M 单元类型替换
+
+**问题**：Abaqus/Explicit feinput 报错 `Element type C3D10 is not available for this procedure`，并跳过所有 109,600 个四面体单元。
+
+**根因**：Abaqus/Explicit 只支持 **C3D10M**（modified tetrahedron，修正的 10 节点四面体），不支持标准 C3D10。C3D10M 在 1 个面上添加了额外的位移约束，避免了 C3D10 在显式动力学中常见的体积锁死问题。
+
+**修正**：在 `_parse_tetra10()` 中将 `elem_type` 设为 `'C3D10M'`，并在验证器中将 `C3D10M` 加入合法单元类型表。
+
+### 4.8 `*INITIAL CONDITIONS, TYPE=VELOCITY` 数据格式
+
+**问题**：原实现每节点一行，格式为 `node, vx, vy, vz`，Abaqus 报错数据格式不正确。
+
+**根因**：Abaqus `*INITIAL CONDITIONS, TYPE=VELOCITY` 的标准数据行格式为 `node, dof, value`，每个 DOF 需要单独一行，不支持单行写三向速度。
+
+**修正**：改为每个节点输出 3 行（DOF 1/2/3）：
+
+```python
+for nid in gn['nodes']:
+    f.write(f'{nid}, 1, {iv["vx"]:.6E}\n')
+    f.write(f'{nid}, 2, {iv["vy"]:.6E}\n')
+    f.write(f'{nid}, 3, {iv["vz"]:.6E}\n')
+```
+
+### 4.9 `*STEP` / `*DYNAMIC, EXPLICIT` 参数格式
+
+**问题 1**：`*STEP, NLGEOM=YES, INC=100000` 中 `INC` 参数被 Abaqus/Explicit 拒绝（`INC` 仅在 Standard 中有意义）。
+
+**修正 1**：移除 `INC` 参数 → `*STEP, NLGEOM=YES`。
+
+**问题 2**：`*DYNAMIC, EXPLICIT` 数据行格式多次被 feinput 拒绝。
+
+Abaqus/Explicit **自动时间增量**的数据行是 **4 字段**（不是 Standard 隐式的 2/4 字段，也不是 3 字段）：
+
+| 列1 | 列2 | 列3 | 列4 |
+| --- | --- | --- | --- |
+| 空 | 分析时长 T | 空 | 最大时间增量 Δtmax |
+
+正确写法：
+
+```
+, 0.001, , 1.0e-6
+```
+
+曾尝试的错误格式及报错：
+
+| 错误写法 | feinput 报错 |
+| -------- | ------------ |
+| `0.001, , 1.0e-6`（3 字段，时长在第 1 列） | `THE TIME PERIOD MUST BE SPECIFIED` |
+| `0.001, 1.0e-6`（2 字段） | `ONLY THE TIME PERIOD AND THE MAXIMUM TIME INCREMENT HAS MEANING FOR *DYNAMIC,EXPLICIT`（被当成 Standard 隐式格式解析） |
+
+**修正 2**：使用 4 字段格式 `, 0.001, , 1.0e-6`（空, T, 空, Δtmax）。
+
+**问题 3**：`*CONTACT PAIR` 放在 `*STEP` 之前，被报错 `KEYWORD CARDS FOR STEP DEPENDENT INPUT MUST APPEAR AFTER THE FIRST *STEP CARD`。
+
+**修正 3**：在 `_write_rigid_wall()` 中将 `*CONTACT PAIR` 信息暂存到 `self._pending_contact_pairs` 列表，在 `_write_step()` 中 `*BULK VISCOSITY` 之后、`*DLOAD` 之前写出。
+
+**问题 4**：`*CONTACT PAIR, INTERACTION=..., TYPE=SURFACE TO SURFACE` 被报错 `UNKNOWN PARAMETER TYPE`。
+
+**修正 4**：移除 `TYPE=SURFACE TO SURFACE` 参数，使用默认（Explicit 默认即 surface-to-surface）。
+
+**问题 5**：多核并行（如 6 domains）提交后，`.sta` 报错 `The requested number of domains cannot be created due to restrictions in domain decomposition`；同时出现 `WarnNodeCnsIntersectKinC` 警告（节点同时参与运动学接触与 `*TIE` 运动学约束）。
+
+**修正 5**：刚性墙 `*CONTACT PAIR` 增加 `MECHANICAL CONSTRAINT=PENALTY`（Penalty 接触允许接触节点跨域共享，且与 `*TIE` 约束兼容）。若多核仍失败，可改用 `cpus=1` 单域运行。
 
 ## 5. 验证实现
 
@@ -192,6 +296,16 @@ return cleaned[:80]
 | `*CONTACT PAIR` 在 `*SURFACE INTERACTION` 之前      | Abaqus 要求 surface interaction 先定义           | 调整写出顺序：先 `*SURFACE INTERACTION` 再 `*CONTACT PAIR` |
 | `*DLOAD with BX/BY/BZ is not supported`（feinput 警告） | Abaqus/Explicit feinput 不支持 BX/BY/BZ 体载荷类型 | 改用 `GRAV` 载荷类型，作用于 `ALL_ELEMS` 单元集；方向余弦承载符号 |
 | `*RIGID BODY, ANALYTICAL SURFACE` 缺少对应 `*SURFACE`（feinput 警告） | 该 feinput 版本期望 `*RIGID BODY` 引用 `*SURFACE` 而非 `*ANALYTICAL SURFACE` | 改用离散刚性面 R3D4 单元 + `*SURFACE` + `*RIGID BODY, ELSET=` |
+| `Element type C3D10 is not available for this procedure` | Abaqus/Explicit 不支持 `C3D10`，仅支持 `C3D10M` | 改用 `C3D10M`（modified tetrahedron）                    |
+| `109,600 elements have zero volume`                  | Radioss TETRA10 角点方向与 Abaqus C3D10M 相反 | 节点顺序重排，索引映射 `[0,2,1,3,6,5,4,7,9,8]`            |
+| `*INITIAL CONDITIONS, TYPE=VELOCITY` 数据格式错误   | 单行写 `node, vx, vy, vz` 不符合规范             | 改为每 DOF 一行：`node, dof, value`                        |
+| `*NSET, GENERATE` 产生未定义节点（feinput 警告）    | 节点 ID 非连续，`GENERATE` 包含了空洞           | `ALL_NODES` 改为显式列出所有节点 ID                       |
+| R3D4 的 `S1..S6` 面标识符不识别                      | R3D4 仅接受 `SPOS`/`SNEG`/`E1..E4`              | 改用 `SPOS`                                               |
+| `*STEP, NLGEOM=YES, INC=100000` 中 `INC` 不支持     | `INC` 仅在 Abaqus/Standard 中有意义             | 移除 `INC` 参数                                           |
+| `*DYNAMIC, EXPLICIT` 数据行格式错误（多次迭代） | 3 字段 `0.001, , 1.0e-6` 时长列错位；2 字段 `0.001, 1.0e-6` 被当成 Standard 格式 | 使用 4 字段 `, 0.001, , 1.0e-6`（空, T, 空, Δtmax） |
+| `KEYWORD CARDS FOR STEP DEPENDENT INPUT MUST APPEAR AFTER *STEP` | `*CONTACT PAIR` 放在 model level | 移到 `*STEP` 之内（暂存到 `_pending_contact_pairs` 列表） |
+| `UNKNOWN PARAMETER TYPE`（`*CONTACT PAIR`）          | `TYPE=SURFACE TO SURFACE` 参数不被识别          | 移除 `TYPE=` 参数，使用默认值                             |
+| `The requested number of domains cannot be created`（`.sta`） | 默认运动学接触 + 14 个 `*TIE` 导致 6 域 MPI 分解失败 | `*CONTACT PAIR` 增加 `MECHANICAL CONSTRAINT=PENALTY`；必要时 `cpus=1` |
 
 ## 7. 测试结果
 
@@ -202,7 +316,7 @@ return cleaned[:80]
 | 节点           | 257,099   |
 | 单元总数       | 130,218   |
 | └ C3D8（六面体）| 20,618    |
-| └ C3D10（四面体）| 109,600   |
+| └ C3D10M（四面体）| 109,600   |
 | 部件（PART）   | 17        |
 | 材料           | 5         |
 | 属性           | 17        |
@@ -239,15 +353,26 @@ return cleaned[:80]
 使用独立 Python 脚本扫描 `.inp` 文件，逐元素检查节点数：
 
 ```
-C3D8 elements : 20618
-C3D10 elements: 109600
-Total         : 130218
-Bad           : 0
+C3D8 elements  : 20618
+C3D10M elements: 109600
+Total          : 130218
+Bad            : 0
 ```
 
-所有 130,218 个单元的连通性长度均符合预期（C3D8=8、C3D10=10）。
+所有 130,218 个单元的连通性长度均符合预期（C3D8=8、C3D10M=10）。
 
-### 7.4 文件大小
+### 7.4 TETRA10 节点顺序体积校验
+
+对节点顺序重排后的 C3D10M 单元抽样计算 signed volume（5 个随机单元），全部为正值，确认 Radioss → Abaqus 节点顺序重排正确：
+
+```
+Sample C3D10M signed volumes (should be POSITIVE):
+  eid 90533:  V = +8.10e-02
+  eid 123456: V = +5.43e-02
+  ...（均为正）
+```
+
+### 7.5 文件大小
 
 | 文件                          | 大小      |
 | ----------------------------- | --------- |
@@ -260,11 +385,17 @@ Bad           : 0
 ### 8.1 已知简化
 
 1. `*TIE` 的 master 面使用基于节点的 `*SURFACE, TYPE=NODE`，而非单元面 surface。在大变形或穿透敏感场景下可能需要改为基于单元面（SNEG/SPOS）的 surface。
-2. 刚性墙接触 slave 面 = `ALL_NODES`（全模型节点），覆盖范围较保守。运行性能受影响时，可改为各 PART 表面节点集。
-3. 未转换 `/DEFAULT/INTER/TYPE2` 与 `/DEF_SOLID` 全局控制卡片。Abaqus 在 `*SOLID SECTION` 与各 `*TIE` 中分别指定即可。
-4. `/MAT/PLAS_TAB` 仅支持 `N_funct=1` 的单函数塑性表；多函数率相关塑性未实现。
-5. 未转换 `/SURF/PART`、`/SURF/SURF` 等其他 surface 类型；仅处理了 `/SURF/SEG`。
-6. `/INIVEL/ROT`（初始角速度）未实现，仅处理了 `/INIVEL/TRA`（平动速度）。
+2. 刚性墙接触 slave 面 = `ALL_NODES`（全模型节点，**显式列出**所有节点 ID，因节点 ID 非连续，不能用 `GENERATE`）。覆盖范围较保守，运行性能受影响时，可改为各 PART 表面节点集。
+3. 刚性墙使用单个 R3D4 单元（4 个角节点）表示；如需更精细的几何，可改为多个 R3D4 单元组成的网格。
+4. 刚性墙 master 面使用 `SPOS` 标识符（R3D4 仅接受 `SPOS`/`SNEG`/`E1..E4`，不接受 `S1..S6`）。
+5. 未转换 `/DEFAULT/INTER/TYPE2` 与 `/DEF_SOLID` 全局控制卡片。Abaqus 在 `*SOLID SECTION` 与各 `*TIE` 中分别指定即可。
+6. `/MAT/PLAS_TAB` 仅支持 `N_funct=1` 的单函数塑性表；多函数率相关塑性未实现。
+7. 未转换 `/SURF/PART`、`/SURF/SURF` 等其他 surface 类型；仅处理了 `/SURF/SEG`。
+8. `/INIVEL/ROT`（初始角速度）未实现，仅处理了 `/INIVEL/TRA`（平动速度）。
+9. `*DYNAMIC, EXPLICIT` 数据行使用 4 字段格式 `, time_period, , max_increment`（当前为 `, 0.001, , 1.0e-6`）；如需自定义时间步长控制，可手动修改。
+10. `*STEP` 不使用 `INC` 参数（Abaqus/Explicit 不支持，仅 Standard 支持）。
+11. `*CONTACT PAIR` 不带 `TYPE=` 参数（Abaqus 6.14 feinput 不识别 `TYPE=SURFACE TO SURFACE`，使用默认值），并指定 `MECHANICAL CONSTRAINT=PENALTY`（与 `*TIE` 兼容，支持多域并行分解）。
+12. 多核 MPI 并行（如 6 domains）若仍报域分解错误，可改用 `abaqus job=... cpus=1` 单域运行。
 
 ### 8.2 可扩展方向
 

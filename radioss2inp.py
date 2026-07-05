@@ -395,9 +395,28 @@ class RadiossToAbaqus:
             self.parts[part_id] = {
                 'id': part_id, 'name': f'part{part_id}',
                 'prop_id': 0, 'mat_id': 0,
-                'elem_type': 'C3D10', 'elems': []}
-        self.parts[part_id]['elem_type'] = 'C3D10'
+                'elem_type': 'C3D10M', 'elems': []}
+        # IMPORTANT: use C3D10M (modified tetrahedron) instead of C3D10
+        # because Abaqus/Explicit only supports C3D10M for 10-node tets.
+        self.parts[part_id]['elem_type'] = 'C3D10M'
         # TETRA10: line 1 = eid ; line 2 = 10 nids
+        # Node ordering conversion (Radioss -> Abaqus C3D10M):
+        #   Radioss uses corners (1,2,3) clockwise when viewed from 4.
+        #   Abaqus  uses corners (1,2,3) COUNTER-clockwise from 4.
+        # Swap corners 2 and 3, and swap the corresponding midside nodes:
+        #   old -> new  (1-based)
+        #     1  ->  1
+        #     2  ->  3
+        #     3  ->  2
+        #     4  ->  4
+        #     5  ->  7    (was mid(1,2), now must be mid(1,3)=old N7)
+        #     6  ->  6    (mid(2,3) unchanged)
+        #     7  ->  5    (was mid(1,3), now must be mid(2,1)=old N5)
+        #     8  ->  8    (mid(1,4) unchanged)
+        #     9  -> 10    (was mid(2,4), now must be mid(3,4)=old N10)
+        #    10  ->  9    (was mid(3,4), now must be mid(2,4)=old N9)
+        # 0-based index map: [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]
+        REORDER = [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]
         pending_eid = None
         for line in it:
             s = line.strip()
@@ -416,6 +435,8 @@ class RadiossToAbaqus:
                     try:
                         eid = int(toks[0])
                         nids = [int(t) for t in toks[1:11]]
+                        # apply Radioss->Abaqus node reorder
+                        nids = [nids[i] for i in REORDER]
                         self.parts[part_id]['elems'].append((eid, nids))
                         self.elem_ids.add(eid)
                         self.elem_count += 1
@@ -427,6 +448,8 @@ class RadiossToAbaqus:
                 except ValueError:
                     pending_eid = None
                     continue
+                # apply Radioss->Abaqus node reorder
+                nids = [nids[i] for i in REORDER]
                 self.parts[part_id]['elems'].append((pending_eid, nids))
                 self.elem_ids.add(pending_eid)
                 self.elem_count += 1
@@ -593,7 +616,9 @@ class RadiossToAbaqus:
             self._write_nsets_and_elsets()
             self._write_amplitudes()
             self._write_initial_conditions()
-            self._write_gravity_loads()
+            # NOTE: *DLOAD with GRAV must be written INSIDE the *STEP
+            # block (it is a step-level load, not a model-level option).
+            # Hence _write_gravity_loads() is called from _write_step().
             self._write_tie_constraints()
             self._write_rigid_wall()
             self._write_step()
@@ -722,23 +747,23 @@ class RadiossToAbaqus:
         if not self.inivel:
             return
         f.write('**\n** -- INITIAL VELOCITIES (from /INIVEL/TRA)\n')
+        # Abaqus *INITIAL CONDITIONS, TYPE=VELOCITY data-line format:
+        #   node, dof, value
+        # (each DOF needs its own data line).  We emit 3 lines per node
+        # for DOFs 1, 2, 3 (translations).
         for iv_id, iv in self.inivel.items():
             gn = self.grnod.get(iv['grnod_id'])
             if not gn:
                 self.warnings.append(
                     f'INIVEL {iv_id} references missing GRNOD {iv["grnod_id"]}')
                 continue
-            nset = f'NSET_G{iv["grnod_id"]}_{self._safe_name(gn["name"], prefix=f"NSET_G{iv["grnod_id"]}")}'
-            # Use *INITIAL CONDITIONS, TYPE=VELOCITY on the nset via
-            # repeated data lines (one per node) - or simpler: data-line
-            # form that uses the nset? Abaqus requires per-node data lines
-            # for *INITIAL CONDITIONS, TYPE=VELOCITY.
             f.write(f'** Initial velocity set "{iv["name"]}" '
-                    f'on node set {nset}\n')
+                    f'(grnod_id={iv["grnod_id"]})\n')
             f.write('*INITIAL CONDITIONS, TYPE=VELOCITY\n')
             for nid in gn['nodes']:
-                f.write(f'{nid}, {iv["vx"]:.6E}, {iv["vy"]:.6E}, '
-                        f'{iv["vz"]:.6E}\n')
+                f.write(f'{nid}, 1, {iv["vx"]:.6E}\n')
+                f.write(f'{nid}, 2, {iv["vy"]:.6E}\n')
+                f.write(f'{nid}, 3, {iv["vz"]:.6E}\n')
 
     def _write_gravity_loads(self):
         f = self._f
@@ -829,7 +854,7 @@ class RadiossToAbaqus:
             self._write_int_list(sorted(m_nodes))
             f.write(f'*SURFACE, TYPE=NODE, NAME={master_surf}\n')
             f.write(f'NSET_MASTER_{it_id}\n')
-            f.write(f'*TIE, NAME=TIE_{it_id}, POSITION TOLERANCE=1.0\n')
+            f.write(f'*TIE, NAME=TIE_{it_id}, ADJUST=NO\n')
             f.write(f'{slave_surf}, {master_surf}\n')
 
     def _write_rigid_wall(self):
@@ -845,12 +870,15 @@ class RadiossToAbaqus:
         # SURFACE does not have corresponding *SURFACE" warning that some
         # feinput builds emit when a *RIGID BODY references an analytical
         # surface defined via *ANALYTICAL SURFACE.
-        # Build a node set of ALL nodes in the model so the contact slave
-        # surface covers the whole deformable mesh.
+        # Build a node set of ALL actually-defined nodes in the model so
+        # the contact slave surface covers the whole deformable mesh.
+        # IMPORTANT: do NOT use *NSET, GENERATE here, because the node IDs
+        # in the .rad file are NOT contiguous - GENERATE would emit many
+        # undefined node IDs which feinput later strips with a warning.
         all_nset = 'ALL_NODES'
-        f.write(f'*NSET, NSET={all_nset}, GENERATE\n')
-        if self.node_min_id and self.node_max_id:
-            f.write(f'{self.node_min_id}, {self.node_max_id}, 1\n')
+        f.write(f'*NSET, NSET={all_nset}\n')
+        nids = [n[0] for n in self.nodes]
+        self._write_int_list(nids, per_line=8)
 
         for rw_id, rw in self.rwalls.items():
             # The plane passes through (XM, YM, ZM) with normal direction
@@ -906,13 +934,14 @@ class RadiossToAbaqus:
             f.write(f'{rigid_eid}, {cn_ids[0]}, {cn_ids[1]}, '
                     f'{cn_ids[2]}, {cn_ids[3]}\n')
             # Element-based surface for the rigid wall.
-            # For a single R3D4 element used as a rigid wall we list ALL
-            # six faces (S1..S6) on the surface so the contact works
-            # regardless of which face the deformable mesh approaches.
+            # R3D4 (rigid quadrilateral) only accepts the face identifiers
+            # SPOS (positive side) / SNEG (negative side) / E1..E4 (edges).
+            # We use SPOS so the surface covers the outward face; the
+            # contact algorithm can detect approach from either side
+            # because the rigid body is internally double-sided.
             surf_name = f'RWALL_S{rw_id}'
             f.write(f'*SURFACE, NAME={surf_name}\n')
-            for face in ('S1', 'S2', 'S3', 'S4', 'S5', 'S6'):
-                f.write(f'{elset_name}, {face}\n')
+            f.write(f'{elset_name}, SPOS\n')
             # Rigid body that owns the rigid elements
             f.write(f'*RIGID BODY, REF NODE={ref_nid}, ELSET={elset_name}\n')
             # Fully constrain the reference node (encastre)
@@ -922,33 +951,59 @@ class RadiossToAbaqus:
             slave_surf = f'RWALL_SLAVE_{rw_id}'
             f.write(f'*SURFACE, TYPE=NODE, NAME={slave_surf}\n')
             f.write(f'{all_nset}\n')
-            # Surface interaction (hard contact + friction) - must be
-            # defined before the *CONTACT PAIR that references it.
+            # Surface interaction (hard contact + friction) - this is a
+            # model-level keyword, must be defined before *STEP.
             ip_name = f'RWALL_IP{rw_id}'
             f.write(f'*SURFACE INTERACTION, NAME={ip_name}\n')
             f.write('*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD\n')
             f.write('*FRICTION\n')
             f.write(f'{rw["fric"]:.4f}\n')
-            # Contact pair: deformable slave (nodes) vs rigid master (R3D4)
-            f.write(f'** Contact pair (rigid wall {rw_id})\n')
-            f.write(f'*CONTACT PAIR, INTERACTION={ip_name}, '
-                    f'TYPE=SURFACE TO SURFACE\n')
-            f.write(f'{slave_surf}, {surf_name}\n')
+            # NOTE: *CONTACT PAIR in Abaqus/Explicit 6.14 is a STEP-LEVEL
+            # keyword - it must appear INSIDE the *STEP block, not before
+            # it.  We store the contact pair info and emit it from
+            # _write_step() instead.
+            if not hasattr(self, '_pending_contact_pairs'):
+                self._pending_contact_pairs = []
+            self._pending_contact_pairs.append({
+                'name': f'CP_{rw_id}',
+                'ip_name': ip_name,
+                'slave': slave_surf,
+                'master': surf_name,
+            })
 
     def _write_step(self):
         f = self._f
         f.write('**\n** -- ANALYSIS STEP\n')
-        # Use a dynamic-explicit step - the typical choice for an
-        # explicit drop test.  NLGEOM=YES handles large deformation.
-        f.write('*STEP, NLGEOM=YES, INC=100000\n')
+        # Abaqus/Explicit *STEP does NOT accept the INC parameter
+        # (only Abaqus/Standard does). NLGEOM=YES handles large deformation.
+        f.write('*STEP, NLGEOM=YES\n')
         f.write('*DYNAMIC, EXPLICIT\n')
-        f.write('** t_end,        dt_min,        dt_max\n')
-        f.write('1.0E-3, , \n')
+        # Explicit automatic incrementation: blank, time_period, blank, max_dt
+        f.write(', 0.001, , 1.0e-6\n')
+        # Bulk viscosity for explicit dynamics
         f.write('*BULK VISCOSITY\n')
         f.write('0.06, 1.2\n')
+        # Contact pairs - in Abaqus/Explicit 6.14, *CONTACT PAIR is a
+        # step-level keyword and must appear INSIDE *STEP.  These were
+        # deferred from _write_rigid_wall().
+        if hasattr(self, '_pending_contact_pairs'):
+            f.write('**\n** -- Contact pairs (rigid wall interaction)\n')
+            for cp in self._pending_contact_pairs:
+                # Use penalty enforcement (not default kinematic) so the
+                # rigid-wall contact is compatible with TIE constraints
+                # and multi-domain parallel decomposition.
+                f.write(f'*CONTACT PAIR, INTERACTION={cp["ip_name"]}, '
+                        f'MECHANICAL CONSTRAINT=PENALTY\n')
+                f.write(f'{cp["slave"]}, {cp["master"]}\n')
+        # Gravity loads - must be inside *STEP because the GRAV load
+        # type is a step-level option (not a model-level option).
+        self._write_gravity_loads()
+        # Outputs
         f.write('** Outputs\n')
         f.write('*OUTPUT, FIELD, NUMBER INTERVAL=20\n')
-        f.write('*ELEMENT OUTPUT\n')
+        # Exclude R3D4 (rigid) elements from S/LE/PEEQ output - they
+        # do not support these variables.
+        f.write('*ELEMENT OUTPUT, ELSET=ALL_ELEMS\n')
         f.write('S, LE, PEEQ\n')
         f.write('*NODE OUTPUT\n')
         f.write('U, V, A\n')
@@ -1004,7 +1059,7 @@ class RadiossToAbaqus:
         # 3. element type / connectivity length
         for pid, part in self.parts.items():
             etype = part['elem_type']
-            expected = {'C3D8': 8, 'C3D10': 10}.get(etype, 0)
+            expected = {'C3D8': 8, 'C3D10': 10, 'C3D10M': 10}.get(etype, 0)
             if not expected:
                 self.errors.append(f'Part {pid}: unknown element type {etype}')
                 continue
