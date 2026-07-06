@@ -72,24 +72,23 @@ Radioss 关键字有 2 种 ID 写法：
 
 按 Abaqus 6.14 标准顺序输出（注意：step-level 关键字必须放在 `*STEP` 之内）：
 
-1. `*HEADING` + `*PREPRINT`
+1. `*HEADING` + `*PREPRINT, ECHO=NO, MODEL=NO, HISTORY=NO, CONTACT=NO`（抑制 feinput 大量 echo）
 2. `*NODE`
-3. 每个 PART：`*ELEMENT` + `*SOLID SECTION`
+3. 每个 PART：`*ELEMENT` + `*SOLID SECTION`；全部 PART 写完后立即生成 `*ELSET, ELSET=ALL_ELEMS, GENERATE`（与单元同段，在材料定义之前）
 4. 所有材料：`*MATERIAL` + `*ELASTIC` + `*PLASTIC` + `*DENSITY`
 5. 所有 `*NSET`（来自 /GRNOD/NODE）
-6. `*ELSET`（全局单元集 `ALL_ELEMS`，供 `*DLOAD GRAV` 引用）
-7. `*AMPLITUDE`（来自 /FUNCT）
-8. `*INITIAL CONDITIONS, TYPE=VELOCITY`（每 DOF 一行：`node, dof, value`）
-9. `*TIE` 约束
-10. 刚性墙（model level）：`*NSET (ALL_NODES)` + `*NODE` + `*ELEMENT, TYPE=R3D4` + `*SURFACE` + `*RIGID BODY` + `*BOUNDARY` + `*SURFACE INTERACTION`
-11. `*STEP, NLGEOM=YES`（不带 `INC`）
+6. `*AMPLITUDE`（来自 /FUNCT，供 `/GRAV` 的 `*DLOAD` 引用）
+7. `*INITIAL CONDITIONS, TYPE=VELOCITY`（每 DOF 一行：`node, dof, value`）
+8. `*TIE, ADJUST=NO` 约束（来自 /INTER/TYPE2）
+9. 刚性墙（model level）：`*NSET (ALL_NODES)` + `*NODE` + `*ELEMENT, TYPE=R3D4` + `*SURFACE` + `*RIGID BODY` + `*BOUNDARY` + `*SURFACE INTERACTION`
+10. `*STEP, NLGEOM=YES`（不带 `INC`）
     - `*DYNAMIC, EXPLICIT` + 数据行（4 字段：空, 时长, 空, 最大增量）
     - `*BULK VISCOSITY`
     - `*CONTACT PAIR, MECHANICAL CONSTRAINT=PENALTY`（step level，不带 `TYPE=` 参数）
-    - `*DLOAD GRAV`（step level）
-    - `*OUTPUT` / `*ELEMENT OUTPUT` / `*NODE OUTPUT`
-12. `*END STEP`
-13. 验证报告（以 `**` 注释形式附加）
+    - `*DLOAD, AMPLITUDE=...` + GRAV 数据行（step level）
+    - `*OUTPUT` / `*ELEMENT OUTPUT, ELSET=ALL_ELEMS` / `*NODE OUTPUT`
+11. `*END STEP`
+12. 验证报告（以 `**` 注释形式附加）
 
 ## 4. 关键实现要点
 
@@ -159,8 +158,14 @@ Abaqus 转换中的关键差异：
   elset, GRAV, magnitude, comp1, comp2, comp3
   ```
   其中 `magnitude` 是无符号加速度幅值，`comp1..3` 是单位方向余弦（带符号，承载方向）。
-- **GRNOD → ELSET 映射**：由于 `*DLOAD` 作用于单元，需要把 GRNOD 节点集映射到 ELSET。脚本采用简化策略：生成 `ALL_ELEMS` 全局单元集（用 `*ELSET, GENERATE` 紧凑表示，避免列出 13 万个单元 ID），将所有 GRAV 载荷应用到 `ALL_ELEMS`。这对跌落测试中"重力作用于整个模型"的常规场景是正确的。
+- **GRNOD → ELSET 映射**：由于 `*DLOAD` 作用于单元，需要把 GRNOD 节点集映射到 ELSET。脚本采用简化策略：在 `_write_elements_and_sections()` 末尾生成 `ALL_ELEMS` 全局单元集（用 `*ELSET, GENERATE` 紧凑表示，避免列出 13 万个单元 ID），将所有 GRAV 载荷应用到 `ALL_ELEMS`。这对跌落测试中"重力作用于整个模型"的常规场景是正确的。
 - **符号处理**：当 `fscale < 0` 时，方向余弦取反（如 X 方向加速度为负，则 `comp = (-1, 0, 0)`），`magnitude = |fscale|`，保证加速度方向正确。
+- **幅值关联**：Radioss `/GRAV` 通过 `func_id` 引用 `/FUNCT` 函数表。转换时在 model level 生成 `*AMPLITUDE, NAME=AMP_F{id}_{name}`，step level 的 `*DLOAD` 使用 `AMPLITUDE=` 参数引用该幅值表：
+  ```
+  *DLOAD, AMPLITUDE=AMP_F2_Table_8
+  ALL_ELEMS, GRAV, 5.788234E+03, -1.000000, -0.000000, -0.000000
+  ```
+  若函数为常数 1.0，幅值参数冗余但语法仍合法。
 
 ### 4.5 刚性墙几何重建 → R3D4 离散刚性面
 
@@ -230,7 +235,43 @@ for nid in gn['nodes']:
     f.write(f'{nid}, 3, {iv["vz"]:.6E}\n')
 ```
 
-### 4.9 `*STEP` / `*DYNAMIC, EXPLICIT` 参数格式
+### 4.9 `*TIE, ADJUST=NO`
+
+**问题**：早期使用 `*TIE, NAME=TIE_n, POSITION TOLERANCE=1.0`，Abaqus 在 TIE 约束处理时会自动调整 slave 节点位置以消除初始间隙，大模型中可能引发大量节点调整，并与后续接触/并行分解产生副作用。
+
+**修正**：改为 `*TIE, NAME=TIE_n, ADJUST=NO`，禁止 TIE 自动调整 slave 节点坐标，保持 Radioss 原始几何关系：
+
+```python
+f.write(f'*TIE, NAME=TIE_{it_id}, ADJUST=NO\n')
+f.write(f'{slave_surf}, {master_surf}\n')
+```
+
+**说明**：feinput 可能仍输出 `TIE type MPC converted to PIN type MPC` 警告（slave 节点无转动自由度），属 Abaqus 内部转换，不影响计算继续。
+
+### 4.10 `*PREPRINT` 打印抑制
+
+在 `*HEADING` 之后写入：
+
+```
+*PREPRINT, ECHO=NO, MODEL=NO, HISTORY=NO, CONTACT=NO
+```
+
+**目的**：抑制 feinput 预处理阶段对 `*SURFACE`、`*TIE` 等关键字的大量 echo 输出（大模型中可产生 `DUE TO EXCESSIVE REPORTING, THE ECHO OF THE *SURFACE OPTION IS BEING SUPPRESSED` 等提示），缩短 `.dat` 体积并便于定位真实错误。
+
+### 4.11 `*ELEMENT OUTPUT, ELSET=ALL_ELEMS`
+
+**问题**：若使用无 elset 限定的 `*ELEMENT OUTPUT` + `S, LE, PEEQ`，Abaqus 会对模型中所有单元（含 R3D4 刚性墙单元）请求应力/应变输出，而 R3D4 不支持这些变量。
+
+**修正**：限定输出范围为可变形单元集：
+
+```
+*ELEMENT OUTPUT, ELSET=ALL_ELEMS
+S, LE, PEEQ
+```
+
+`ALL_ELEMS` 在 `_write_elements_and_sections()` 中生成，仅包含 C3D8/C3D10M 单元 ID 范围（`*ELSET, GENERATE`），不含 R3D4。
+
+### 4.12 `*STEP` / `*DYNAMIC, EXPLICIT` 参数格式
 
 **问题 1**：`*STEP, NLGEOM=YES, INC=100000` 中 `INC` 参数被 Abaqus/Explicit 拒绝（`INC` 仅在 Standard 中有意义）。
 
@@ -291,6 +332,9 @@ Abaqus/Explicit **自动时间增量**的数据行是 **4 字段**（不是 Stan
 | 节点统计数 = 0                                       | `node_count` 只在 EOF 分支赋值                  | 在遇到下一个关键字的 `return` 分支也赋值                  |
 | `*DLOAD` 重力方向丢失                                | 错误地取了 `abs(mag)`                          | 保留 `mag` 的符号                                          |
 | `*TIE` 参数拼写错误                                  | `TOLERENCE` 应为 `TOLERANCE`                   | 修正拼写                                                  |
+| `*TIE` 自动调整 slave 节点位置                       | `POSITION TOLERANCE=1.0` 触发大量 nodal adjustment | 改为 `ADJUST=NO`，保持原始几何                         |
+| R3D4 单元请求 S/LE/PEEQ 输出失败                      | `*ELEMENT OUTPUT` 未限定 elset，含刚性单元     | 改为 `*ELEMENT OUTPUT, ELSET=ALL_ELEMS`                   |
+| feinput echo 过多（`*SURFACE` 等被截断）             | 默认打印全部关键字 echo                        | 增加 `*PREPRINT, ECHO=NO, MODEL=NO, HISTORY=NO, CONTACT=NO` |
 | 刚性墙使用 `*SURFACE, TYPE=SEGMENTS`（非解析刚性面） | Abaqus 解析刚性面应使用 `*ANALYTICAL SURFACE`  | 改为 `*ANALYTICAL SURFACE` + `*SYSTEM` + `LINE` 段         |
 | `*VARIABLE MASS SCALING` 引用未定义的 `ALL_ELEMS`   | 未生成全单元集                                  | 移除该行（用户可按需手动添加 mass scaling）               |
 | `*CONTACT PAIR` 在 `*SURFACE INTERACTION` 之前      | Abaqus 要求 surface interaction 先定义           | 调整写出顺序：先 `*SURFACE INTERACTION` 再 `*CONTACT PAIR` |
@@ -306,6 +350,123 @@ Abaqus/Explicit **自动时间增量**的数据行是 **4 字段**（不是 Stan
 | `KEYWORD CARDS FOR STEP DEPENDENT INPUT MUST APPEAR AFTER *STEP` | `*CONTACT PAIR` 放在 model level | 移到 `*STEP` 之内（暂存到 `_pending_contact_pairs` 列表） |
 | `UNKNOWN PARAMETER TYPE`（`*CONTACT PAIR`）          | `TYPE=SURFACE TO SURFACE` 参数不被识别          | 移除 `TYPE=` 参数，使用默认值                             |
 | `The requested number of domains cannot be created`（`.sta`） | 默认运动学接触 + 14 个 `*TIE` 导致 6 域 MPI 分解失败 | `*CONTACT PAIR` 增加 `MECHANICAL CONSTRAINT=PENALTY`；必要时 `cpus=1` |
+| ODB `There is no valid step data available on the database` | `abq6142.exe` 在 PowerShell 管道环境下挂起（CPU=0, 线程等待 UserRequest），求解器从未运行（`.com` 中 `runCalculator:OFF`） | 用 Windows 计划任务（`Start-ScheduledTask`）启动 `run_abaqus.bat`；加 `mp_mode=threads` 避免 MPI 挂起；不使用 `input=` 参数（避免 datacheck 模式） |
+
+## 6.1 ODB "no valid step data" 问题与运行环境
+
+### 现象
+
+转换生成的 `Cell_Phone_Drop.inp` 结构完全正确（`*STEP` + `*DYNAMIC, EXPLICIT` + `*OUTPUT FIELD` + `*ELEMENT OUTPUT` + `*NODE OUTPUT`），但运行 Abaqus 后导入 ODB 时报：
+
+```
+There is no valid step data available on the database.
+```
+
+ODB 文件只有 ~29 MB（仅含模型元数据），没有应力/应变/位移结果。
+
+### 根因
+
+**Abaqus 求解器从未运行**——所有调用方式都导致 `abq6142.exe` 卡在初始化阶段（CPU=0，线程状态=`Wait/UserRequest`，等待交互式控制台输入）。
+
+诊断证据：
+- `.com` 文件中 `'runCalculator':OFF` + `'interactive':None`（求解器未触发）
+- `.sta` 文件停在 `Most critical elements`（域分解后未进入时间积分）
+- `.dat` 文件结尾仅 `END OF USER INPUT PROCESSING` + `JOB TIME SUMMARY`（无 `ANALYSIS PHASE`）
+
+尝试失败的所有调用方式（在工具内通过 PowerShell 启动）：
+1. `& abaqus job=... interactive`（PowerShell `&` 调用）—— 卡住
+2. `Start-Process -RedirectStandardOutput` —— stdout 重定向导致卡住
+3. `Start-Process -WindowStyle Normal`（新窗口）—— 卡住
+4. `background` 模式 —— 卡住
+5. 直接调用 `abq6142.exe` —— 卡住
+6. `[System.Diagnostics.Process]::Start()` + 关闭 stdin —— 卡住
+
+`abq6142.exe` 在 PowerShell 管道/重定向环境下无法获得交互式控制台，进入无限等待状态。
+
+### 解决方案：Windows 计划任务
+
+使用 `Register-ScheduledTask` + `Start-ScheduledTask` 在独立会话中启动 abaqus，完全绕过 PowerShell 控制台问题：
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "d:\training\caedecoder\radioss2inp\run_abaqus.bat" `
+    -WorkingDirectory "d:\training\caedecoder\radioss2inp"
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+Register-ScheduledTask -TaskName "AbaqusCellPhone2" -Action $action `
+    -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName "AbaqusCellPhone2"
+```
+
+配套的 `run_abaqus.bat`：
+
+```bat
+@echo off
+cd /d d:\training\caedecoder\radioss2inp
+abaqus job=Cell_Phone_Drop interactive ask_delete=off mp_mode=threads cpus=4 double=both
+echo Abaqus exit code: %errorlevel%
+```
+
+### 关键运行参数说明
+
+| 参数 | 取值 | 说明 |
+| ---- | ---- | ---- |
+| `job` | `Cell_Phone_Drop` | 任务名（自动使用同名 `Cell_Phone_Drop.inp`） |
+| `interactive` | （无值） | 前台交互模式，触发 `runCalculator:ON` |
+| `ask_delete=off` | —— | 覆盖旧输出文件不询问 |
+| `mp_mode=threads` | —— | **避免 MPI 挂起**（默认 MPI 模式在工具环境下也会卡住） |
+| `cpus=4` | —— | 4 线程并行 |
+| `double=both` | —— | 双精度输出 |
+
+**注意**：不要使用 `input=Cell_Phone_Drop.inp` 显式参数（会让 Abaqus 误解析为 datacheck 模式，导致 `runCalculator:OFF`）。
+
+### ODB 结果验证
+
+`check_odb.py` 用于验证 ODB 是否包含结果数据（使用 `abaqus python` 运行以获得 `odbAccess` 模块）：
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "d:\training\caedecoder\radioss2inp\check_odb.bat" `
+    -WorkingDirectory "d:\training\caedecoder\radioss2inp"
+Register-ScheduledTask -TaskName "OdbCheck" -Action $action -Force | Out-Null
+Start-ScheduledTask -TaskName "OdbCheck"
+```
+
+`check_odb.bat`：
+
+```bat
+@echo off
+cd /d d:\training\caedecoder\radioss2inp
+abaqus python check_odb.py Cell_Phone_Drop.odb > odb_check_result.txt 2>&1
+```
+
+`check_odb.py` 检查 6 类必须结果：`S`（应力）、`LE`（应变）、`PEEQ`（等效塑性应变）、`U`（位移）、`V`（速度）、`A`（加速度）。
+
+### 验证结果
+
+计划任务启动后，`explicit_dp.exe` 成功运行（CPU 持续上升至 1000+ 秒，内存 ~2 GB），`.sta` 显示：
+
+```
+STEP 1  ORIGIN 0.0000
+INCREMENT  STEP TIME  TOTAL TIME  CPU TIME  STABLE INCREMENT  ...
+        0  0.000E+00  0.000E+00   00:00:07  9.436E-09  ...
+      312  5.002E-06  5.002E-06   00:02:00  1.645E-08  ...
+     3048  5.001E-05  5.001E-05   00:17:08  1.645E-08  ...
+ODB Field Frame Number      1 of     20 requested intervals at  5.001221E-05
+```
+
+ODB 检查输出：
+
+```
+Number of steps: 1
+Step: Step-1, Number of frames: 2
+Frame 1: time=5.001221e-05
+  S: 603344 values     [OK]
+  LE: 603344 values    [OK]
+  PEEQ: 233848 values  [OK]
+  U: 257104 values     [OK]
+  V: 257104 values     [OK]
+  A: 257104 values     [OK]
+>>> SUCCESS: ODB contains result data!
+```
 
 ## 7. 测试结果
 
@@ -384,7 +545,7 @@ Sample C3D10M signed volumes (should be POSITIVE):
 
 ### 8.1 已知简化
 
-1. `*TIE` 的 master 面使用基于节点的 `*SURFACE, TYPE=NODE`，而非单元面 surface。在大变形或穿透敏感场景下可能需要改为基于单元面（SNEG/SPOS）的 surface。
+1. `*TIE` 的 master 面使用基于节点的 `*SURFACE, TYPE=NODE`，而非单元面 surface；`*TIE` 使用 `ADJUST=NO`（不自动调整 slave 节点）。在大变形或穿透敏感场景下可能需要改为基于单元面（SNEG/SPOS）的 surface。
 2. 刚性墙接触 slave 面 = `ALL_NODES`（全模型节点，**显式列出**所有节点 ID，因节点 ID 非连续，不能用 `GENERATE`）。覆盖范围较保守，运行性能受影响时，可改为各 PART 表面节点集。
 3. 刚性墙使用单个 R3D4 单元（4 个角节点）表示；如需更精细的几何，可改为多个 R3D4 单元组成的网格。
 4. 刚性墙 master 面使用 `SPOS` 标识符（R3D4 仅接受 `SPOS`/`SNEG`/`E1..E4`，不接受 `S1..S6`）。
@@ -396,6 +557,8 @@ Sample C3D10M signed volumes (should be POSITIVE):
 10. `*STEP` 不使用 `INC` 参数（Abaqus/Explicit 不支持，仅 Standard 支持）。
 11. `*CONTACT PAIR` 不带 `TYPE=` 参数（Abaqus 6.14 feinput 不识别 `TYPE=SURFACE TO SURFACE`，使用默认值），并指定 `MECHANICAL CONSTRAINT=PENALTY`（与 `*TIE` 兼容，支持多域并行分解）。
 12. 多核 MPI 并行（如 6 domains）若仍报域分解错误，可改用 `abaqus job=... cpus=1` 单域运行。
+13. `*ELEMENT OUTPUT` 限定为 `ELSET=ALL_ELEMS`，不含 R3D4 刚性单元。
+14. `/GRAV` 的 `*DLOAD` 通过 `AMPLITUDE=` 引用 `/FUNCT` 转换的幅值表；`*PREPRINT` 关闭 feinput echo。
 
 ### 8.2 可扩展方向
 
@@ -412,6 +575,9 @@ radioss2inp/
 ├── Cell_Phone_Drop_0000.rad   # OpenRadioss 输入文件示例
 ├── Cell_Phone_Drop.inp         # 转换生成的 Abaqus 输入文件
 ├── radioss2inp.py              # 转换脚本（含解析器、写出器、验证器）
+├── run_abaqus.bat              # Abaqus 运行批处理（计划任务调用）
+├── check_odb.py                # ODB 结果检查脚本（abaqus python 运行）
+├── check_odb.bat               # ODB 检查批处理（计划任务调用）
 ├── README.md                   # 用户文档
 └── DEV_SUMMARY.md              # 开发总结文档（本文件）
 ```
