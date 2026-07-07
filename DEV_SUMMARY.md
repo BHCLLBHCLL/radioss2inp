@@ -2,7 +2,12 @@
 
 ## 1. 项目目标
 
-将 OpenRadioss Starter 输入文件（`.rad`）转换为 Abaqus 6.14 输入文件（`.inp`），并确保输出文件符合 Abaqus 输入规范。目标模型为 `Cell_Phone_Drop_0000.rad`（手机跌落测试，约 42 MB）。
+将 OpenRadioss Starter 输入文件（`.rad`）转换为下游格式，目标模型为 `Cell_Phone_Drop_0000.rad`（手机跌落测试，约 42 MB）：
+
+| 脚本 | 输出 | 用途 |
+| ---- | ---- | ---- |
+| `radioss2inp.py` | Abaqus 6.14 `.inp` | 显式动力学求解 |
+| `radioss2vtk.py` | VTK `.vtk` / `.vtu` | 网格可视化（ParaView 等） |
 
 ## 2. 输入文件分析
 
@@ -541,9 +546,114 @@ Sample C3D10M signed volumes (should be POSITIVE):
 | `Cell_Phone_Drop.inp`        | 39,010,613 字节（约 37 MB） |
 | `radioss2inp.py`             | 48,078 字节（约 47 KB）     |
 
-## 8. 已知限制与未来工作
+| `Cell_Phone_Drop.inp`        | 39,010,613 字节（约 37 MB） |
+| `Cell_Phone_Drop.vtk`        | 约 45 MB（legacy ASCII）    |
+| `radioss2inp.py`             | 约 48 KB                    |
+| `radioss2vtk.py`             | 约 18 KB                    |
 
-### 8.1 已知简化
+## 9. radioss2vtk：.rad → VTK 网格
+
+### 9.1 设计目标
+
+提供轻量级可视化路径：只解析几何网格（节点 + 单元 + 刚性墙），不转换材料、载荷、接触、分析步。解析策略与 `radioss2inp.py` 相同（单遍流式 `_dispatch_keyword`），但实现独立脚本，避免引入 Abaqus 相关逻辑。
+
+### 9.2 解析范围
+
+| Radioss 关键字 | 处理方式 |
+| -------------- | -------- |
+| `/BEGIN`、`/TITLE` | 读取标题与单位 |
+| `/NODE` | 全部节点坐标 |
+| `/PART` | 部件 ID、材料 ID（写入 CellData） |
+| `/BRICK` | 8 节点六面体 |
+| `/TETRA10` | 10 节点四面体（双行记录） |
+| `/RWALL/PLANE` | 解析平面参数，**合成**地板四边形网格 |
+| 其余（`/MAT`、`/GRAV`、`/INTER` 等） | 跳过 |
+
+### 9.3 单元类型映射
+
+| Radioss | VTK cell type | 值 | 说明 |
+| ------- | ------------- | -- | ---- |
+| `/BRICK` | `VTK_HEXAHEDRON` | 12 | 8 节点，原生顺序 |
+| `/TETRA10` | `VTK_QUADRATIC_TETRA` | 24 | 10 节点，**Radioss 原生顺序**（不做 C3D10M 重排） |
+| `/RWALL/PLANE`（合成） | `VTK_QUAD` | 9 | 400×400 mm 四边形 |
+
+`--linear-tet` 选项可将 TETRA10 降为 4 节点 `VTK_TETRA`（10），供不支持二次单元的工具使用。
+
+### 9.4 与 radioss2inp 的关键差异
+
+| 项目 | radioss2inp | radioss2vtk |
+| ---- | ----------- | ----------- |
+| TETRA10 节点顺序 | 重排为 Abaqus C3D10M `[0,2,1,3,6,5,4,7,9,8]` | 保留 Radioss 原生顺序 |
+| `/RWALL/PLANE` | R3D4 + `*RIGID BODY` + 接触对 | 合成 4 角点 + 1 个 QUAD |
+| 材料/载荷/接触 | 完整转换 | 不转换 |
+| 验证器 | 13 项 Abaqus 规范检查 | 无（仅缺失节点警告） |
+
+### 9.5 刚性墙（地板）合成
+
+`/RWALL/PLANE` 在 `.rad` 中**没有网格**，只有平面几何（过点 M、法向 M→M1）。若不在转换时合成，VTK 输出会缺少地板。
+
+算法与 `radioss2inp.py` 的 R3D4 离散面一致：
+
+1. 法向 `n = normalize(M1 - M)`
+2. 构造平面内正交向量 `u`、`v`
+3. 以 M 为中心、半尺寸 L=200 mm，生成 4 个角点
+4. 写入 1 个 `VTK_QUAD`，`PartId = 90000 + rw_id`（与普通 PART 区分）
+
+示例（`Cell_Phone_Drop`）：角点坐标与 `.inp` 中节点 9100010–9100013 一致。
+
+### 9.6 输出格式与场数据
+
+**Legacy ASCII `.vtk`**（默认）：
+
+```
+# vtk DataFile Version 3.0
+DATASET UNSTRUCTURED_GRID
+POINTS ...
+CELLS ...
+CELL_TYPES ...
+POINT_DATA
+  SCALARS NodeId int 1        # 原始 Radioss 节点 ID（含合成墙节点）
+CELL_DATA
+  SCALARS PartId int 1        # PART id；刚性墙 = 90001
+  SCALARS MaterialId int 1
+  SCALARS ElementId int 1
+```
+
+**`.vtu`**（`--vtu` 或输出扩展名为 `.vtu`）：XML + binary base64，体积更小、ParaView 加载更快。
+
+### 9.7 用法
+
+```bash
+python radioss2vtk.py                                    # 默认 rad → vtk
+python radioss2vtk.py input.rad output.vtk
+python radioss2vtk.py input.rad output.vtu --vtu           # 二进制 VTU
+python radioss2vtk.py input.rad output.vtk --linear-tet    # TETRA10 → 线性四面体
+```
+
+### 9.8 转换统计（Cell_Phone_Drop）
+
+```
+nodes         : 257,103  （257,099 模型节点 + 4 墙角点）
+cells         : 130,219  （130,218 模型单元 + 1 QUAD 地板）
+  HEX8        : 20,618
+  TETRA10     : 109,600
+  QUAD (wall) : 1
+parts         : 17
+rigid walls   : 1
+```
+
+ParaView 中用 `PartId` 着色：`90001` 为地板，1–28 为各部件。
+
+### 9.9 已知限制
+
+1. 不输出材料属性、边界条件、接触、TIE 等非几何信息。
+2. 刚性墙为单个 400×400 mm 四边形，与 `radioss2inp` 相同简化。
+3. TETRA10 使用 Radioss 原生节点顺序；若 ParaView 中二次四面体显示异常，可试 `--linear-tet`。
+4. Legacy `.vtk` ASCII 对大模型体积较大，建议用 `.vtu`。
+
+## 10. 已知限制与未来工作（radioss2inp）
+
+### 10.1 已知简化
 
 1. `*TIE` 的 master 面使用基于节点的 `*SURFACE, TYPE=NODE`，而非单元面 surface；`*TIE` 使用 `ADJUST=NO`（不自动调整 slave 节点）。在大变形或穿透敏感场景下可能需要改为基于单元面（SNEG/SPOS）的 surface。
 2. 刚性墙接触 slave 面 = `ALL_NODES`（全模型节点，**显式列出**所有节点 ID，因节点 ID 非连续，不能用 `GENERATE`）。覆盖范围较保守，运行性能受影响时，可改为各 PART 表面节点集。
@@ -560,21 +670,24 @@ Sample C3D10M signed volumes (should be POSITIVE):
 13. `*ELEMENT OUTPUT` 限定为 `ELSET=ALL_ELEMS`，不含 R3D4 刚性单元。
 14. `/GRAV` 的 `*DLOAD` 通过 `AMPLITUDE=` 引用 `/FUNCT` 转换的幅值表；`*PREPRINT` 关闭 feinput echo。
 
-### 8.2 可扩展方向
+### 10.2 可扩展方向
 
 - **新增关键字**：在 `_dispatch_keyword()` 中添加新的 `elif` 分支，并实现对应的 `_parse_xxx()` 方法。
 - **单元面 surface**：建立 element-face 查找表，将 `*TIE` 与 `*CONTACT PAIR` 的 master 面改为单元面 surface。
 - **多函数塑性**：解析 `N_funct > 1` 的 `/MAT/PLAS_TAB`，生成 Abaqus `*PLASTIC, RATE=...` 多行表。
 - **GUI 前端**：可基于 PyQt 或 Web 界面包装脚本，提供文件选择与转换进度显示。
+- **radioss2vtk 扩展**：输出材料名/密度为 CellData；支持 `/SURF/SEG` 边界面；VTK PolyData 多 block 按 PART 分块。
 - **Abaqus CAE 验证**：使用 Abaqus CAE 的 `mdb.ModelFromInputFile()` API 自动验证 `.inp` 文件能否被 Abaqus 读取，作为更严格的端到端测试。
 
-## 9. 文件清单
+## 11. 文件清单
 
 ```
 radioss2inp/
 ├── Cell_Phone_Drop_0000.rad   # OpenRadioss 输入文件示例
 ├── Cell_Phone_Drop.inp         # 转换生成的 Abaqus 输入文件
-├── radioss2inp.py              # 转换脚本（含解析器、写出器、验证器）
+├── Cell_Phone_Drop.vtk         # 转换生成的 VTK 网格（可视化）
+├── radioss2inp.py              # .rad → .inp（含解析器、写出器、验证器）
+├── radioss2vtk.py              # .rad → .vtk / .vtu（网格可视化）
 ├── run_abaqus.bat              # Abaqus 运行批处理（计划任务调用）
 ├── check_odb.py                # ODB 结果检查脚本（abaqus python 运行）
 ├── check_odb.bat               # ODB 检查批处理（计划任务调用）
